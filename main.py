@@ -16,7 +16,7 @@ from rubpy.bot import filters
 # توکن را فقط در Railway Variables با نام RUBIKA_BOT_TOKEN قرار بده.
 # توکن را داخل GitHub یا فایل عمومی قرار نده.
 BOT_TOKEN = os.getenv("RUBIKA_BOT_TOKEN", "").strip()
-OWNER_ID = "u0JqbDA066cbe71805604c50f6cbf260,u0FhIWa0e41576451a9e60e146303fde"
+OWNER_ID = "u0JqbDA066cbe71805604c50f6cbf260"
 
 # اختیاری: برای پاسخ هوشمند، کلید API را وارد کن.
 OPENAI_API_KEY = ""
