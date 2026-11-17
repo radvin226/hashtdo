@@ -12,8 +12,8 @@ from pathlib import Path
 from rubpy import BotClient
 
 # توکن و شناسه مالک را فقط در همین فایل تنظیم کن.
-BOT_TOKEN = "PASTE_RUBIKA_BOT_TOKEN_HERE"
-OWNER_ID = "PASTE_OWNER_USER_ID_HERE"
+BOT_TOKEN = "CJFIGB0XRATJPKOIMVHICALXXUMKLGQMTOEEVZUHCAGIJKYONBVGGFDUUADBMEAV"
+OWNER_ID = "u0JqbDA090f5a2a05ec475e33e5b75c9"
 
 # اختیاری: برای پاسخ هوشمند، کلید API را وارد کن.
 OPENAI_API_KEY = ""
