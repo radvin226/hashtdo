@@ -52,8 +52,18 @@ class Store:
         CREATE TABLE IF NOT EXISTS groups(chat_id TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS mutes(chat_id TEXT NOT NULL,user_id TEXT NOT NULL,until_ts REAL NOT NULL DEFAULT 0,reason TEXT NOT NULL,PRIMARY KEY(chat_id,user_id));
         CREATE TABLE IF NOT EXISTS warnings(chat_id TEXT NOT NULL,user_id TEXT NOT NULL,count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(chat_id,user_id));
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         """)
         self.db.commit()
+
+    async def set_setting(self, key, value):
+        async with self.lock:
+            self.db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(key), str(value)))
+            self.db.commit()
+
+    async def get_setting(self, key):
+        row = self.db.execute("SELECT value FROM settings WHERE key=?", (str(key),)).fetchone()
+        return row["value"] if row else None
 
     async def active(self, chat):
         row = self.db.execute("SELECT active FROM groups WHERE chat_id=?", (str(chat),)).fetchone()
@@ -167,9 +177,13 @@ async def send(chat, text, reply_to=None):
 
 async def report_owner(text):
     try:
-        await send(OWNER_ID, "📣 گزارش 802 BOT\n\n" + text)
+        owner_chat = await store.get_setting("owner_chat_id")
+        if not owner_chat:
+            log.warning("شناسه گفت‌وگوی خصوصی مالک ثبت نشده؛ مالک باید در PV ربات /start بزند.")
+            return
+        await send(owner_chat, "📣 گزارش 802 BOT\n\n" + text)
     except Exception:
-        log.exception("ارسال گزارش به PV مالک ناموفق بود؛ مالک باید ابتدا /start بزند.")
+        log.exception("ارسال گزارش به PV مالک ناموفق بود.")
 
 
 async def delete_message(update, chat, mid):
@@ -239,6 +253,9 @@ async def handle_private(update, message):
     chat, user = chat_id(update), sender_id(message)
     text = str(getv(message, "text", default="") or "").strip()
     if text == "/start":
+        if user == OWNER_ID and chat:
+            await store.set_setting("owner_chat_id", chat)
+            log.info("Owner private chat registered.")
         await send(chat, "درود! من 802 هستم.\n\n📘 جزوه علوم\n📗 جزوه ریاضی\n🚪 خروج\n\nشناسه شما: " + user)
     elif text == "/owner":
         await send(chat, "✅ مالک اصلی تأیید شد." if user == OWNER_ID else "⛔ شما مالک ثبت‌شده نیستید.\nشناسه شما: " + user)
