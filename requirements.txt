@@ -1,5 +1,2 @@
-rubpy[rtc]
-aiortc
-av
-python-dotenv
-aiofiles
+rubpy>=7.3.5
+openai>=1.50.0

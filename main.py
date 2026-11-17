@@ -1,389 +1,367 @@
 # -*- coding: utf-8 -*-
-"""
-802 بات — نسخه نهایی کامل
-کارها از اکانت عادی | پاسخ‌ها از بات
-آنتی‌فحش + استیکر + گیف + اسپم + سکوت ۱۰ دقیقه‌ای + کال + پخش
-"""
-
+"""802 BOT — Rubika Bot API / token mode only."""
 import asyncio
-import json
-import os
+import logging
+import re
+import sqlite3
 import time
+import unicodedata
 from collections import defaultdict, deque
 from pathlib import Path
 
-from rubpy import Client
-from rubpy.bot import BotClient
-from rubpy.types import Update
+from rubpy import BotClient
 
-from config import *
-from swear_words import has_swear
-from voice_chat_player import VoiceChatPlayer
+# توکن و شناسه مالک را فقط در همین فایل تنظیم کن.
+BOT_TOKEN = "PASTE_RUBIKA_BOT_TOKEN_HERE"
+OWNER_ID = "PASTE_OWNER_USER_ID_HERE"
 
-Path(DATA_DIR).mkdir(exist_ok=True)
-Path(TEMP_DIR).mkdir(exist_ok=True)
-Path(MUSIC_DIR).mkdir(exist_ok=True)
+# اختیاری: برای پاسخ هوشمند، کلید API را وارد کن.
+OPENAI_API_KEY = ""
+AI_MODEL = "gpt-4o-mini"
+AI_GROUP_ENABLED = True
 
-# ---------------- داده پایدار ----------------
-def load(path, default=None):
-    if default is None:
-        default = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+DATA_DIR = Path("data")
+DB_PATH = DATA_DIR / "802.sqlite3"
+SCIENCE_FILE = Path("resources/science.pdf")
+MATH_FILE = Path("resources/math.pdf")
+TEMP_MUTE_SECONDS = 10 * 60
+SPAM_WINDOW_SECONDS = 30
+SPAM_LIMIT = 5
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("802")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+if BOT_TOKEN == "PASTE_RUBIKA_BOT_TOKEN_HERE" or not BOT_TOKEN.strip():
+    raise RuntimeError("توکن ربات را در ابتدای main.py وارد کن.")
+if OWNER_ID == "PASTE_OWNER_USER_ID_HERE" or not OWNER_ID.strip():
+    raise RuntimeError("شناسه مالک را در OWNER_ID ابتدای main.py وارد کن.")
+
+bot = BotClient(token=BOT_TOKEN, rate_limit=0.5, parse_mode=None)
+
+
+class Store:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.lock = asyncio.Lock()
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS groups(chat_id TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS mutes(chat_id TEXT NOT NULL,user_id TEXT NOT NULL,until_ts REAL NOT NULL DEFAULT 0,reason TEXT NOT NULL,PRIMARY KEY(chat_id,user_id));
+        CREATE TABLE IF NOT EXISTS warnings(chat_id TEXT NOT NULL,user_id TEXT NOT NULL,count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(chat_id,user_id));
+        """)
+        self.db.commit()
+
+    async def active(self, chat):
+        row = self.db.execute("SELECT active FROM groups WHERE chat_id=?", (str(chat),)).fetchone()
+        return bool(row and row["active"])
+
+    async def set_active(self, chat):
+        async with self.lock:
+            self.db.execute("INSERT INTO groups(chat_id,active) VALUES(?,1) ON CONFLICT(chat_id) DO UPDATE SET active=1", (str(chat),))
+            self.db.commit()
+
+    async def mute(self, chat, user, seconds, reason):
+        until = 0 if seconds <= 0 else time.time() + seconds
+        async with self.lock:
+            self.db.execute("INSERT INTO mutes(chat_id,user_id,until_ts,reason) VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET until_ts=excluded.until_ts,reason=excluded.reason",
+                            (str(chat), str(user), until, reason))
+            self.db.commit()
+
+    async def mute_info(self, chat, user):
+        row = self.db.execute("SELECT until_ts,reason FROM mutes WHERE chat_id=? AND user_id=?", (str(chat), str(user))).fetchone()
+        if not row:
+            return None
+        until = float(row["until_ts"])
+        if until and time.time() >= until:
+            await self.unmute(chat, user)
+            return None
+        return dict(row)
+
+    async def unmute(self, chat, user):
+        async with self.lock:
+            self.db.execute("DELETE FROM mutes WHERE chat_id=? AND user_id=?", (str(chat), str(user)))
+            self.db.commit()
+
+    async def warn(self, chat, user):
+        async with self.lock:
+            self.db.execute("INSERT INTO warnings(chat_id,user_id,count) VALUES(?,?,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET count=count+1",
+                            (str(chat), str(user)))
+            row = self.db.execute("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (str(chat), str(user))).fetchone()
+            self.db.commit()
+            return int(row["count"])
+
+
+store = Store(str(DB_PATH))
+
+SWEAR_WORDS = [
+    "احمق", "بی شعور", "بی‌شعور", "کص", "کس", "کیر", "کون", "جنده",
+    "مادرجنده", "ننه جنده", "کسکش", "کسخل", "گاییدم", "گوه", "عن",
+    "خایه", "لاشی", "حرومزاده", "حرامزاده", "خفه شو", "گمشو", "سگ پدر",
+    "ننه سگ", "کیری", "جقی", "جق", "کص ننت", "ننت جنده", "مادرت جنده",
+    "کیرم", "کونت", "fuck", "fck", "fuk", "shit", "bitch", "asshole",
+    "bastard", "motherfucker", "cunt", "dick", "pussy", "cock", "whore",
+    "slut", "stfu", "fucker", "shithead", "siktir", "orospu", "amk",
+    "amına", "piç", "göt", "sik", "amq",
+]
+BLOCKED_EMOJIS = ("🖕", "🍆", "🍑", "💦", "👉👌")
+
+
+def normalize(value):
+    value = unicodedata.normalize("NFKC", str(value or "")).lower()
+    for old, new in {"ي":"ی", "ى":"ی", "ك":"ک", "ة":"ه", "ۀ":"ه", "أ":"ا", "إ":"ا", "آ":"ا"}.items():
+        value = value.replace(old, new)
+    value = re.sub(r"[\u064b-\u065f\u0670]", "", value)
+    value = re.sub(r"(.)\1{2,}", r"\1\1", value)
+    value = re.sub(r"[\W_]+", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+TERMS = tuple(normalize(word) for word in SWEAR_WORDS)
+
+
+def has_swear(text):
+    clean = f" {normalize(text)} "
+    return any(term and f" {term} " in clean for term in TERMS)
+
+
+def has_blocked_emoji(text):
+    return any(item in str(text or "") for item in BLOCKED_EMOJIS)
+
+
+def getv(obj, *keys, default=None):
+    for key in keys:
+        value = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+        if value is not None:
+            return value
     return default
 
-def save(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
-owner = load(OWNER_FILE, {})
-active_groups = load(ACTIVE_GROUPS_FILE, {})
-muted = load(MUTED_FILE, {})  # {group: {user: {"until": ts|0, "reason": "..."}}}
+def chat_id(update):
+    return str(getv(update, "chat_id", default="") or "")
 
-def is_owner(guid: str) -> bool:
-    return bool(guid) and owner.get("guid") == str(guid)
 
-def is_active(guid: str) -> bool:
-    return active_groups.get(guid, False)
+def sender_id(message):
+    return str(getv(message, "sender_id", default="") or "")
 
-def is_muted(group: str, user: str) -> bool:
-    data = muted.get(group, {}).get(str(user))
-    if not data:
+
+def message_id(message):
+    return getv(message, "message_id")
+
+
+def reply_id(message):
+    return str(getv(message, "reply_to_message_id", default="") or "")
+
+
+def is_private(chat):
+    return chat.startswith("u0")
+
+
+def is_group(chat):
+    return chat.startswith(("g0", "c0"))
+
+
+async def send(chat, text, reply_to=None):
+    kwargs = {"reply_to_message_id": str(reply_to)} if reply_to else {}
+    return await bot.send_message(str(chat), str(text), **kwargs)
+
+
+async def report_owner(text):
+    try:
+        await send(OWNER_ID, "📣 گزارش 802 BOT\n\n" + text)
+    except Exception:
+        log.exception("ارسال گزارش به PV مالک ناموفق بود؛ مالک باید ابتدا /start بزند.")
+
+
+async def delete_message(update, chat, mid):
+    if not mid:
         return False
-    until = data.get("until", 0)
-    if until == 0:  # دائمی
+    try:
+        await update.delete(chat_id=str(chat), message_id=str(mid))
         return True
-    if time.time() < until:
+    except Exception:
+        log.exception("حذف پیام ناموفق بود: %s", mid)
+        return False
+
+
+async def send_note(chat, path, title):
+    if not path.exists():
+        await send(chat, f"فایل «{title}» هنوز در پوشه resources قرار نگرفته است.")
+        return
+    await bot.send_file(str(chat), file=str(path), type="File", text=title)
+
+
+def media_kind(message):
+    sticker = getv(message, "sticker")
+    file_obj = getv(message, "file")
+    file_type = str(getv(file_obj, "type", default="") or "").lower()
+    file_name = str(getv(file_obj, "file_name", default="") or "").lower()
+    if sticker:
+        return "استیکر"
+    if "gif" in file_type or file_name.endswith(".gif"):
+        return "GIF"
+    return ""
+
+
+spam_times = defaultdict(lambda: deque(maxlen=SPAM_LIMIT + 2))
+
+
+def is_spam(chat, user):
+    now = time.time()
+    q = spam_times[(str(chat), str(user))]
+    q.append(now)
+    while q and now - q[0] > SPAM_WINDOW_SECONDS:
+        q.popleft()
+    return len(q) >= SPAM_LIMIT
+
+
+async def ai_reply(chat, prompt, group=False):
+    if not OPENAI_API_KEY:
+        await send(chat, "در خدمتم. لطفاً سؤال را واضح‌تر مطرح کنید.")
+        return
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        result = await client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {"role":"system","content":"تو دستیار فارسی‌زبان 802 هستی؛ مؤدب، امن، کوتاه و مفید پاسخ بده."},
+                {"role":"user","content":prompt},
+            ],
+            max_tokens=220,
+        )
+        await send(chat, (result.choices[0].message.content or "در خدمتم.")[:2500])
+    except Exception:
+        log.exception("AI failed")
+        await send(chat, "فعلاً پاسخ‌گوی هوشمند با خطا روبه‌رو شده است.")
+
+
+async def handle_private(update, message):
+    chat, user = chat_id(update), sender_id(message)
+    text = str(getv(message, "text", default="") or "").strip()
+    if text == "/start":
+        await send(chat, "درود! من 802 هستم.\n\n📘 جزوه علوم\n📗 جزوه ریاضی\n🚪 خروج\n\nشناسه شما: " + user)
+    elif text == "/owner":
+        await send(chat, "✅ مالک اصلی تأیید شد." if user == OWNER_ID else "⛔ شما مالک ثبت‌شده نیستید.\nشناسه شما: " + user)
+    elif text == "جزوه علوم":
+        await send_note(chat, SCIENCE_FILE, "جزوه علوم")
+    elif text == "جزوه ریاضی":
+        await send_note(chat, MATH_FILE, "جزوه ریاضی")
+    elif text in ("خروج", "/exit"):
+        await send(chat, "از منوی جزوه خارج شدید.")
+    elif text and not text.startswith("/"):
+        await ai_reply(chat, text)
+
+
+# نگهداری فرستنده پیام‌ها برای دستورات ریپلای
+replied_senders = {}
+
+
+async def owner_command(update, message, chat, user, text):
+    if user != OWNER_ID:
+        return False
+    if text == "فعال":
+        await store.set_active(chat)
+        await send(chat, "✅ 802 در این گروه فعال شد.")
+        await report_owner(f"گروه فعال شد: {chat}")
         return True
-    # منقضی شده
-    muted[group].pop(str(user), None)
-    if not muted[group]:
-        muted.pop(group, None)
-    save(MUTED_FILE, muted)
+    if text in ("راهنما", "/help"):
+        await send(chat, "راهنمای مالک:\nفعال — فعال‌سازی گروه\nراهنما — راهنما\n(ریپلای) اخطار — ثبت اخطار\n(ریپلای) حذف سکوت — رفع محدودیت داخلی")
+        return True
+    target_mid = reply_id(message)
+    if text == "اخطار":
+        target = replied_senders.get((chat, target_mid))
+        if not target:
+            await send(chat, "روی پیام کاربر ریپلای کن؛ پیام باید پس از روشن‌شدن ربات دریافت شده باشد.")
+            return True
+        count = await store.warn(chat, target)
+        await send(chat, f"⚠️ اخطار شماره {count} برای کاربر {target} ثبت شد.")
+        await report_owner(f"اخطار شماره {count}\nگروه: {chat}\nکاربر: {target}")
+        return True
+    if text == "حذف سکوت":
+        target = replied_senders.get((chat, target_mid))
+        if not target:
+            await send(chat, "روی پیام کاربر ریپلای کن؛ پیام باید پس از روشن‌شدن ربات دریافت شده باشد.")
+            return True
+        await store.unmute(chat, target)
+        await send(chat, f"🔊 محدودیت داخلی کاربر {target} برداشته شد.")
+        await report_owner(f"رفع محدودیت\nگروه: {chat}\nکاربر: {target}")
+        return True
     return False
 
-def set_mute(group: str, user: str, seconds: int = 0, reason: str = "فحش"):
-    """seconds=0 یعنی دائمی"""
-    until = 0 if seconds <= 0 else int(time.time()) + seconds
-    muted.setdefault(group, {})[str(user)] = {"until": until, "reason": reason}
-    save(MUTED_FILE, muted)
 
-def remove_mute(group: str, user: str):
-    if group in muted and str(user) in muted[group]:
-        muted[group].pop(str(user), None)
-        if not muted[group]:
-            muted.pop(group, None)
-        save(MUTED_FILE, muted)
+async def handle_group(update, message):
+    chat, user = chat_id(update), sender_id(message)
+    mid = message_id(message)
+    text = str(getv(message, "text", default="") or "").strip()
+    if not chat or not user:
+        return
+    if mid:
+        replied_senders[(chat, str(mid))] = user
+        if len(replied_senders) > 5000:
+            replied_senders.clear()
 
-# ---------------- اسپم دیتکتور ساده ----------------
-spam_tracker = defaultdict(lambda: deque(maxlen=10))
+    if await owner_command(update, message, chat, user, text):
+        return
+    if not await store.active(chat) or user == OWNER_ID:
+        return
 
-def is_spam(user: str, window=30, limit=5) -> bool:
-    now = time.time()
-    q = spam_tracker[str(user)]
-    q.append(now)
-    while q and now - q[0] > window:
-        q.popleft()
-    return len(q) >= limit
+    if await store.mute_info(chat, user):
+        await delete_message(update, chat, mid)
+        return
 
-# ---------------- کلاینت‌ها ----------------
-account = Client(ACCOUNT_SESSION)
-bot = BotClient(BOT_TOKEN)
+    reason, duration = None, 0
+    if has_swear(text) or has_blocked_emoji(text):
+        reason = "کلمات یا ایموجی نامناسب"
+    else:
+        kind = media_kind(message)
+        if kind:
+            reason, duration = f"ارسال {kind}", TEMP_MUTE_SECONDS
+        elif is_spam(chat, user):
+            reason, duration = "ارسال پیام‌های پشت‌سرهم", TEMP_MUTE_SECONDS
 
-active_voices = {}
-
-async def bot_reply(chat_id: str, text: str):
-    try:
-        await bot.send_message(chat_id, text)
-    except Exception as e:
-        print("خطا بات:", e)
-
-async def notify_owner(text: str):
-    if owner.get("guid"):
-        try:
-            await bot.send_message(owner["guid"], f"📢 **802 بات**\n\n{text}")
-        except Exception as e:
-            print("خطا نوتیف:", e)
-
-async def get_name(user_guid: str) -> str:
-    try:
-        info = await account.get_user_info(user_guid)
-        return getattr(info, "first_name", None) or user_guid
-    except Exception:
-        return user_guid
-
-# =========================================================
-#                   هندلر اصلی (روی اکانت)
-# =========================================================
-@account.on_message_updates()
-async def handler(update: Update):
-    try:
-        guid = getattr(update, "object_guid", None)
-        if not guid:
-            return
-
-        author = getattr(update, "author_guid", None)
-        text = (getattr(update, "raw_text", None) or getattr(update, "text", None) or "").strip()
-        message_id = getattr(update, "message_id", None)
-        reply_id = getattr(update, "reply_message_id", None) or getattr(update, "reply_to_message_id", None)
-
-        is_private = str(guid).startswith("u0")
-        is_group = str(guid).startswith("g0")
-
-        is_sticker = bool(getattr(update, "sticker", None) or getattr(getattr(update, "message", None), "sticker", None))
-        is_gif = bool(
-            getattr(update, "gif", None)
-            or getattr(getattr(update, "message", None), "gif", None)
-            or "gif" in str(getattr(update, "type", "")).lower()
+    if reason:
+        deleted = await delete_message(update, chat, mid)
+        await store.mute(chat, user, duration, reason)
+        duration_text = "تا رفع توسط مالک" if duration == 0 else "۱۰ دقیقه"
+        await send(chat, f"⚠️ پیام کاربر {user} به دلیل {reason} شناسایی شد. محدودیت داخلی: {duration_text}.")
+        await report_owner(
+            f"🚨 تخلف شناسایی شد\nگروه: {chat}\nکاربر: {user}\nدلیل: {reason}\n"
+            f"متن: {text[:350] or '[رسانه]'}\nحذف پیام: {'موفق' if deleted else 'ناموفق/بدون مجوز'}"
         )
+        return
 
-        # ==================== پیوی ====================
-        if is_private:
-            if text == "/owner":
-                owner["guid"] = str(author)
-                save(OWNER_FILE, owner)
-                await bot_reply(guid, "✅ شما به عنوان **اونر** ثبت شدید.\nاز این لحظه فقط شما در گروه‌ها فرمان می‌دهید.")
-                return
+    if AI_GROUP_ENABLED and text and (text.lower().startswith(("802", "۸۰۲", "@802")) or "?" in text or "؟" in text):
+        await ai_reply(chat, text, group=True)
 
-            if text in ["/start", "شروع", "استارت"]:
-                await bot_reply(guid,
-                    "درخواست شما چیست؟\n"
-                    "کامند مورد نظر را بگویید:\n\n"
-                    "• جزوه علوم\n"
-                    "• جزوه ریاضی\n"
-                    "• خروج"
-                )
-                return
 
-            if "جزوه علوم" in text:
-                await bot_reply(guid, "📚 جزوه علوم آماده است.\n(اینجا فایل یا لینک جزوه را قرار دهید)")
-                return
-            if "جزوه ریاضی" in text:
-                await bot_reply(guid, "📐 جزوه ریاضی آماده است.\n(اینجا فایل یا لینک جزوه را قرار دهید)")
-                return
-            if text == "خروج":
-                await bot_reply(guid, "خداحافظ 🌟")
-                return
-
-            polite = [
-                "چطور می‌تونم کمکتون کنم؟",
-                "بله، در خدمتم. لطفاً واضح‌تر بفرمایید.",
-                "با احترام، متوجه نشدم. دوباره بفرمایید.",
-                "در خدمتم 🌟"
-            ]
-            await bot_reply(guid, polite[hash(text) % len(polite)])
+@bot.on_update()
+async def on_update(client, update):
+    try:
+        message = getv(update, "new_message")
+        if message is None:
             return
-
-        # ==================== گروه ====================
-        if is_group:
-
-            if text == "فعال":
-                if is_owner(author):
-                    active_groups[guid] = True
-                    save(ACTIVE_GROUPS_FILE, active_groups)
-                    await bot_reply(guid, "✅ بات **802** در این گروه فعال شد.")
-                    await notify_owner(f"گروه فعال شد:\n`{guid}`")
-                return
-
-            if not is_active(guid):
-                return
-
-            # اگر کاربر سکوت است → پیامش رو پاک کن
-            if is_muted(guid, author) and not is_owner(author):
-                try:
-                    await account.delete_messages(guid, [message_id])
-                except Exception:
-                    pass
-                return
-
-            # ---------- دستورات فقط اونر ----------
-            if is_owner(author):
-
-                if text == "کال":
-                    try:
-                        if guid in active_voices:
-                            try:
-                                active_voices[guid].stop()
-                            except Exception:
-                                pass
-                            del active_voices[guid]
-                        await account.create_group_voice_chat(guid)
-                        await bot_reply(guid, "🔊 ویس‌کال شروع شد.\nروی آهنگ ریپلای بزنید و بنویسید: **پخش**")
-                        await notify_owner(f"کال در گروه `{guid}` شروع شد.")
-                    except Exception as e:
-                        await bot_reply(guid, f"❌ خطا در شروع کال:\n`{e}`")
-                    return
-
-                if text == "قطع کال":
-                    try:
-                        if guid in active_voices:
-                            try:
-                                active_voices[guid].stop()
-                            except Exception:
-                                pass
-                            del active_voices[guid]
-                        try:
-                            await account.leave_group_voice_chat(guid)
-                        except Exception:
-                            pass
-                        await bot_reply(guid, "🔇 کال قطع شد.")
-                        await notify_owner(f"کال در گروه `{guid}` قطع شد.")
-                    except Exception as e:
-                        await bot_reply(guid, f"❌ خطا در قطع کال:\n`{e}`")
-                    return
-
-                if text == "پخش":
-                    if not reply_id:
-                        await bot_reply(guid, "لطفاً روی پیام آهنگ ریپلای بزنید و بنویسید: **پخش**")
-                        return
-                    await bot_reply(guid, "🎵 در حال آماده‌سازی و پخش آهنگ...")
-                    try:
-                        file_path = await account.download(
-                            message_id=reply_id,
-                            object_guid=guid,
-                            file_name=f"{TEMP_DIR}/music_{guid}.mp3"
-                        )
-                        if not file_path or not os.path.exists(str(file_path)):
-                            await bot_reply(guid, "❌ نتونستم فایل آهنگ را دانلود کنم.")
-                            return
-                        connection = await account.voice_chat_player(guid, Path(file_path))
-                        if connection:
-                            active_voices[guid] = connection
-                            await bot_reply(guid, "✅ آهنگ در حال پخش است.")
-                            await notify_owner(f"آهنگ در گروه `{guid}` پخش شد.")
-                        else:
-                            await bot_reply(guid, "❌ پخش آهنگ ناموفق بود.")
-                    except Exception as e:
-                        await bot_reply(guid, f"❌ خطا در پخش:\n`{e}`")
-                    return
-
-                if text == "حذف سکوت":
-                    if not reply_id:
-                        await bot_reply(guid, "روی پیام کاربر ریپلای بزنید و بنویسید: **حذف سکوت**")
-                        return
-                    try:
-                        msgs = await account.get_messages_by_id(guid, [reply_id])
-                        target_user = None
-                        if msgs and hasattr(msgs, "messages") and msgs.messages:
-                            target_user = getattr(msgs.messages[0], "author_object_guid", None)
-                        if target_user and is_muted(guid, target_user):
-                            try:
-                                await account.ban_group_member(guid, target_user, action="Unset")
-                            except Exception:
-                                pass
-                            remove_mute(guid, target_user)
-                            name = await get_name(target_user)
-                            await bot_reply(guid, f"✅ سکوت کاربر **{name}** برداشته شد.")
-                            await notify_owner(f"سکوت کاربر `{target_user}` در گروه `{guid}` برداشته شد.")
-                        else:
-                            await bot_reply(guid, "این کاربر سکوت نیست یا پیام پیدا نشد.")
-                    except Exception as e:
-                        await bot_reply(guid, f"❌ خطا در حذف سکوت:\n`{e}`")
-                    return
-
-            # ---------- آنتی فحش (دائمی) ----------
-            if text and has_swear(text) and not is_owner(author):
-                try:
-                    await account.delete_messages(guid, [message_id])
-                except Exception:
-                    pass
-                try:
-                    await account.ban_group_member(guid, author, action="Set")
-                except Exception as e:
-                    print("ban error:", e)
-                set_mute(guid, author, seconds=0, reason="فحش")
-                name = await get_name(author)
-                await bot_reply(
-                    guid,
-                    f"🚫 کاربر **{name}** به دلیل استفاده از کلمات نامناسب سکوت شد.\n"
-                    f"برای برداشتن سکوت، اونر باید روی پیامش ریپلای بزنه و بنویسه: **حذف سکوت**"
-                )
-                await notify_owner(
-                    f"🚫 فحش\nگروه: `{guid}`\nکاربر: `{author}` ({name})\nمتن: `{text[:120]}`"
-                )
-                return
-
-            # ---------- استیکر (۱۰ دقیقه) ----------
-            if is_sticker and not is_owner(author):
-                try:
-                    await account.delete_messages(guid, [message_id])
-                except Exception:
-                    pass
-                try:
-                    await account.ban_group_member(guid, author, action="Set")
-                except Exception:
-                    pass
-                set_mute(guid, author, seconds=TEMP_MUTE_SECONDS, reason="استیکر")
-                name = await get_name(author)
-                await bot_reply(
-                    guid,
-                    f"🚫 کاربر **{name}** به دلیل ارسال **استیکر** به مدت ۱۰ دقیقه سکوت شد."
-                )
-                await notify_owner(f"استیکر\nگروه: `{guid}`\nکاربر: `{author}` ({name})")
-                return
-
-            # ---------- گیف (۱۰ دقیقه) ----------
-            if is_gif and not is_owner(author):
-                try:
-                    await account.delete_messages(guid, [message_id])
-                except Exception:
-                    pass
-                try:
-                    await account.ban_group_member(guid, author, action="Set")
-                except Exception:
-                    pass
-                set_mute(guid, author, seconds=TEMP_MUTE_SECONDS, reason="گیف")
-                name = await get_name(author)
-                await bot_reply(
-                    guid,
-                    f"🚫 کاربر **{name}** به دلیل ارسال **گیف** به مدت ۱۰ دقیقه سکوت شد."
-                )
-                await notify_owner(f"گیف\nگروه: `{guid}`\nکاربر: `{author}` ({name})")
-                return
-
-            # ---------- اسپم (۱۰ دقیقه) ----------
-            if author and is_spam(author) and not is_owner(author):
-                try:
-                    await account.delete_messages(guid, [message_id])
-                except Exception:
-                    pass
-                try:
-                    await account.ban_group_member(guid, author, action="Set")
-                except Exception:
-                    pass
-                set_mute(guid, author, seconds=TEMP_MUTE_SECONDS, reason="اسپم")
-                name = await get_name(author)
-                await bot_reply(
-                    guid,
-                    f"🚫 کاربر **{name}** به دلیل **اسپم** به مدت ۱۰ دقیقه سکوت شد."
-                )
-                await notify_owner(f"اسپم\nگروه: `{guid}`\nکاربر: `{author}` ({name})")
-                return
-
-    except Exception as e:
-        print("خطای کلی:", e)
+        chat = chat_id(update)
+        if is_private(chat):
+            await handle_private(update, message)
+        elif is_group(chat):
+            await handle_group(update, message)
+    except Exception:
+        log.exception("خطا در پردازش آپدیت")
 
 
-# =========================================================
-#                   اجرا
-# =========================================================
+@bot.on_start()
+async def on_start(client):
+    log.info("802 BOT started in token mode.")
+    try:
+        info = await client.get_me()
+        log.info("Bot: %s", getv(info, "bot_title", "username", default="unknown"))
+    except Exception:
+        log.exception("get_me failed")
+
+
 async def main():
-    print("در حال راه‌اندازی بات 802...")
-
-    await account.start()
-    print("✅ اکانت عادی آماده است (کارها)")
-
-    await bot.start()
-    print("✅ بات آماده است (پاسخ‌ها)")
-
-    account.voice_chat_player = VoiceChatPlayer.voice_chat_player.__get__(account, Client)
-
-    print("✅ سیستم کامل 802 فعال شد")
-    print("کارها از اکانت | پاسخ‌ها از بات")
-    print("آنتی‌فحش + استیکر + گیف + اسپم + کال + پخش")
-
-    await asyncio.Event().wait()
+    await bot.run()
 
 
 if __name__ == "__main__":

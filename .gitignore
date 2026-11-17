@@ -1,9 +1,6 @@
-data/
-temp/
-music/
-*.session
-*.session-journal
-.env
 __pycache__/
-*.pyc
-*.log
+*.py[cod]
+.venv/
+.env
+data/
+resources/*.pdf
