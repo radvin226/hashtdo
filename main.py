@@ -2,6 +2,7 @@
 """802 BOT — Rubika Bot API / token mode only."""
 import asyncio
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -10,9 +11,11 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from rubpy import BotClient
+from rubpy.bot import filters
 
-# توکن و شناسه مالک را فقط در همین فایل تنظیم کن.
-BOT_TOKEN = "CJFIGB0XRATJPKOIMVHICALXXUMKLGQMTOEEVZUHCAGIJKYONBVGGFDUUADBMEAV"
+# توکن را فقط در Railway Variables با نام RUBIKA_BOT_TOKEN قرار بده.
+# توکن را داخل GitHub یا فایل عمومی قرار نده.
+BOT_TOKEN = os.getenv("RUBIKA_BOT_TOKEN", "").strip()
 OWNER_ID = "u0JqbDA090f5a2a05ec475e33e5b75c9"
 
 # اختیاری: برای پاسخ هوشمند، کلید API را وارد کن.
@@ -32,8 +35,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("802")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-if BOT_TOKEN == "PASTE_RUBIKA_BOT_TOKEN_HERE" or not BOT_TOKEN.strip():
-    raise RuntimeError("توکن ربات را در ابتدای main.py وارد کن.")
+if not BOT_TOKEN:
+    raise RuntimeError("متغیر RUBIKA_BOT_TOKEN در Railway تنظیم نشده است.")
 if OWNER_ID == "PASTE_OWNER_USER_ID_HERE" or not OWNER_ID.strip():
     raise RuntimeError("شناسه مالک را در OWNER_ID ابتدای main.py وارد کن.")
 
@@ -146,19 +149,15 @@ def sender_id(message):
 
 
 def message_id(message):
-    return getv(message, "message_id")
+    # در مدل RubPy، message.message_id خودش یک شیء MessageId است.
+    value = getv(message, "message_id")
+    return getv(value, "message_id", "new_message_id", default=value)
 
 
 def reply_id(message):
     return str(getv(message, "reply_to_message_id", default="") or "")
 
 
-def is_private(chat):
-    return chat.startswith("u0")
-
-
-def is_group(chat):
-    return chat.startswith(("g0", "c0"))
 
 
 async def send(chat, text, reply_to=None):
@@ -335,19 +334,28 @@ async def handle_group(update, message):
         await ai_reply(chat, text, group=True)
 
 
-@bot.on_update()
-async def on_update(client, update):
+@bot.on_update(filters.private)
+async def on_private_update(client, update):
     try:
         message = getv(update, "new_message")
         if message is None:
             return
-        chat = chat_id(update)
-        if is_private(chat):
-            await handle_private(update, message)
-        elif is_group(chat):
-            await handle_group(update, message)
+        log.info("Private update received | type=%s", getv(update, "type", default="unknown"))
+        await handle_private(update, message)
     except Exception:
-        log.exception("خطا در پردازش آپدیت")
+        log.exception("خطا در پردازش پیام خصوصی")
+
+
+@bot.on_update(filters.group)
+async def on_group_update(client, update):
+    try:
+        message = getv(update, "new_message")
+        if message is None:
+            return
+        log.info("Group update received | type=%s", getv(update, "type", default="unknown"))
+        await handle_group(update, message)
+    except Exception:
+        log.exception("خطا در پردازش پیام گروه")
 
 
 @bot.on_start()
